@@ -199,16 +199,18 @@ cmd_start() {
   [[ "$screen_index" =~ ^[0-9]+$ ]] || die "invalid --screen-index"
 
   # Timelapse while capturing: keep every SPEED-th frame, scale, encode to TS (grows on disk; no long post-encode).
-  local vf="framestep=${speed},scale=min(iw\\,${max_w}):-2:flags=lanczos,format=yuv420p"
+  # force_divisible_by=2: libx264 requires even size. muxdelay/preload+zerolatency+short GOP: first TS packets land quickly.
+  local vf="framestep=${speed},scale=min(iw\\,${max_w}):-2:flags=lanczos:force_divisible_by=2,format=yuv420p"
 
   set +e
-  "$FFMPEG" -nostdin -hide_banner -loglevel warning \
+  "$FFMPEG" -nostdin -hide_banner -loglevel warning -flush_packets 1 \
     -f avfoundation -capture_cursor 1 -framerate "$framerate" \
     -i "${screen_index}:none" \
     -vf "$vf" \
-    -c:v libx264 -preset veryfast -crf "$crf" -pix_fmt yuv420p \
+    -c:v libx264 -preset veryfast -tune zerolatency -g "$(( framerate * 2 ))" \
+    -crf "$crf" -pix_fmt yuv420p \
     -an \
-    -f mpegts \
+    -f mpegts -muxdelay 0 -muxpreload 0 \
     -y "$raw" 2>"${staging}/ffmpeg-capture.log" &
   local cap_pid=$!
   set -e
@@ -222,6 +224,7 @@ cmd_start() {
   fi
 
   echo "$PROG: recording ${speed}× timelapse → $raw (screen :$screen_index, ${framerate} fps, pid $cap_pid)" >&2
+  echo "$PROG: let it run several seconds before stop so frames can be written (especially at high --speed)." >&2
   echo "$PROG: stop with: $PROG stop (remux only; should be quick)" >&2
 }
 
@@ -249,8 +252,10 @@ cmd_stop() {
   local sz
   sz="$(wc -c <"$RAW_FILE" | tr -d ' ')"
   (( sz >= 1024 )) || {
+    echo "$PROG: capture log (tail):" >&2
+    [[ -s "${SESSION_DIR}/ffmpeg-capture.log" ]] && tail -30 "${SESSION_DIR}/ffmpeg-capture.log" >&2 || echo "(no log)" >&2
     rm -f "$STATE_FILE"
-    die "raw recording is empty or too small ($sz bytes): $RAW_FILE — session cleared; remove staging if you like: rm -rf $SESSION_DIR"
+    die "raw recording is empty or too small ($sz bytes): $RAW_FILE — session cleared. If you stopped very soon after start, wait a few seconds next time (timelapse skips frames). Staging: $SESSION_DIR"
   }
 
   local ts out_mp4 logf

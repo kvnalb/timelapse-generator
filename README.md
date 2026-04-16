@@ -67,6 +67,16 @@ Defaults: **60×** speedup, files under **`<repo>/output/`** (see section above)
 
 Override ffmpeg path: `FFMPEG=/opt/homebrew/bin/ffmpeg ./timelapse.sh start`.
 
+## Empty `raw.ts` / “0 bytes” after `stop`
+
+Wait **a few seconds** after `start` before `stop`, especially with **high `--speed`** (fewer frames written per second of wall clock). If it still fails, check **`output/.staging/.../ffmpeg-capture.log`** (Screen Recording permission, odd display size, etc.).
+
+## Other tools (vs ffmpeg)
+
+For **scriptable** screen capture + encode on the Mac, **ffmpeg** is still the usual default: one binary, lots of filters, good community answers.
+
+If you want **fewer AVFoundation quirks** and are OK writing a small app: **ScreenCaptureKit** (Swift) is the native API (smooth start/stop, content filters in v1 of our spec). **OBS Studio** is strong for interactive recording, less so for a tiny CLI. **GStreamer** is another pipeline toolkit (similar tradeoffs to ffmpeg).
+
 ## v0 limits
 
 Records the **entire main display** shown by AVFoundation’s **first “Capture screen”** device (override with `--screen-index`). **No per-app exclusion** (see design doc for a possible v1).
