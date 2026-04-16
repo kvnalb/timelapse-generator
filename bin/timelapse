@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# Local timelapse recorder (macOS + ffmpeg). See docs/superpowers/specs/
+
+set -euo pipefail
+
+readonly PROG="$(basename "$0")"
+readonly STATE_DIR="${HOME}/.timelapse-generator"
+readonly STATE_FILE="${STATE_DIR}/session.env"
+readonly DEFAULT_OUT="${HOME}/Movies/Timelapse"
+readonly DEFAULT_SPEED=60
+readonly DEFAULT_MAX_WIDTH=1280
+readonly DEFAULT_CRF=28
+readonly FFMPEG="${FFMPEG:-ffmpeg}"
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+# macOS Screen Recording is granted per host app (Cursor, Terminal, iTerm, …), not per shell script.
+host_app_for_screen_recording() {
+  local cmd
+  cmd="$(ps -p "$PPID" -o command= 2>/dev/null || true)"
+  if [[ -n "${CURSOR_TRACE:-}" ]] || [[ -n "${CURSOR_AGENT:-}" ]] || [[ "$cmd" == *'/Cursor.app/'* ]] || [[ "$cmd" == *' Cursor.app'* ]]; then
+    echo "Cursor"
+    return
+  fi
+  case "${TERM_PROGRAM:-}" in
+    Apple_Terminal) echo "Terminal" ;;
+    iTerm.app) echo "iTerm" ;;
+    vscode) echo "Cursor or Visual Studio Code" ;;
+    WarpTerminal) echo "Warp" ;;
+    *) [[ -n "${TERM_PROGRAM:-}" ]] && echo "$TERM_PROGRAM" || echo "the app that hosts this shell" ;;
+  esac
+}
+
+screen_recording_settings_line() {
+  local app
+  app="$(host_app_for_screen_recording)"
+  echo "System Settings → Privacy & Security → Screen Recording → enable **${app}** (ffmpeg inherits this shell’s app)."
+}
+
+require_ffmpeg() {
+  command -v "$FFMPEG" >/dev/null 2>&1 || die "ffmpeg not found (install with Homebrew or set FFMPEG=path/to/ffmpeg)"
+}
+
+# First "Capture screen …" device in list_devices output → AVFoundation video index.
+avfoundation_screen_index() {
+  local idx
+  idx="$("$FFMPEG" -hide_banner -f avfoundation -list_devices true -i "" 2>&1 \
+    | sed -n 's/.*\[\([0-9][0-9]*\)\] Capture screen.*/\1/p' | head -1)"
+  [[ -n "$idx" ]] || die "could not find a Capture screen device; run: $FFMPEG -f avfoundation -list_devices true -i \"\""
+  echo "$idx"
+}
+
+ensure_state_dir() { mkdir -p "$STATE_DIR"; }
+
+cleanup_stale_session() {
+  [[ -f "$STATE_FILE" ]] || return 0
+  # shellcheck source=/dev/null
+  source "$STATE_FILE" 2>/dev/null || true
+  if [[ -n "${PID:-}" ]] && ! kill -0 "$PID" 2>/dev/null; then
+    echo "$PROG: removing stale session (pid $PID not running); staging: ${SESSION_DIR:-?}" >&2
+    rm -f "$STATE_FILE"
+  fi
+}
+
+write_state() {
+  local staging="$1" raw="$2" speed="$3" out_dir="$4" screen_index="$5" framerate="$6" cap_pid="$7"
+  ensure_state_dir
+  {
+    printf 'SESSION_DIR=%q\n' "$staging"
+    printf 'RAW_FILE=%q\n' "$raw"
+    printf 'SPEED=%q\n' "$speed"
+    printf 'OUT_DIR=%q\n' "$out_dir"
+    printf 'SCREEN_INDEX=%q\n' "$screen_index"
+    printf 'FRAMERATE=%q\n' "$framerate"
+    printf 'PID=%q\n' "$cap_pid"
+  } >"${STATE_FILE}.tmp"
+  mv "${STATE_FILE}.tmp" "$STATE_FILE"
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  $PROG start [--speed N] [--out-dir DIR] [--screen-index I] [--framerate F]
+  $PROG stop  [--crf N] [--max-width W]
+
+Record the main display with ffmpeg (AVFoundation), then encode a fixed-speedup
+H.264 MP4 (yuv420p), no audio.
+
+Defaults: speed=${DEFAULT_SPEED}, out-dir=$DEFAULT_OUT, encode max-width=${DEFAULT_MAX_WIDTH}, crf=${DEFAULT_CRF}
+
+Environment:
+  FFMPEG   path to ffmpeg (default: ffmpeg on PATH)
+
+Examples:
+  $PROG start
+  $PROG start --speed 30 --out-dir ~/Desktop
+  $PROG stop
+EOF
+}
+
+cmd_start() {
+  local speed="$DEFAULT_SPEED" out_dir="$DEFAULT_OUT" screen_index="" framerate=30
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --speed) speed="${2:-}"; shift 2 || die "--speed needs a value";;
+      --out-dir) out_dir="${2:-}"; shift 2 || die "--out-dir needs a path";;
+      --screen-index) screen_index="${2:-}"; shift 2 || die "--screen-index needs a number";;
+      --framerate) framerate="${2:-}"; shift 2 || die "--framerate needs a value";;
+      -h|--help) usage; exit 0;;
+      *) die "unknown option: $1";;
+    esac
+  done
+  [[ "$speed" =~ ^[0-9]+$ ]] && (( speed >= 1 )) || die "--speed must be a positive integer"
+  [[ "$framerate" =~ ^[0-9]+$ ]] && (( framerate >= 1 )) || die "--framerate must be a positive integer"
+
+  cleanup_stale_session
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$STATE_FILE"
+    [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null && die "a session is already recording (pid $PID); run: $PROG stop"
+  fi
+
+  mkdir -p "$out_dir"
+  local session_id staging raw
+  session_id="$(uuidgen 2>/dev/null || openssl rand -hex 8)"
+  staging="${out_dir}/.staging/${session_id}"
+  mkdir -p "$staging"
+  raw="${staging}/raw.mp4"
+
+  [[ -n "$screen_index" ]] || screen_index="$(avfoundation_screen_index)"
+  [[ "$screen_index" =~ ^[0-9]+$ ]] || die "invalid --screen-index"
+
+  set +e
+  "$FFMPEG" -hide_banner -loglevel warning \
+    -f avfoundation -capture_cursor 1 -framerate "$framerate" \
+    -i "${screen_index}:none" \
+    -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p \
+    -an \
+    -y "$raw" 2>"${staging}/ffmpeg-capture.log" &
+  local cap_pid=$!
+  set -e
+  write_state "$staging" "$raw" "$speed" "$out_dir" "$screen_index" "$framerate" "$cap_pid"
+
+  sleep 0.35
+  if ! kill -0 "$cap_pid" 2>/dev/null; then
+    rm -f "$STATE_FILE"
+    echo "$PROG: $(screen_recording_settings_line)" >&2
+    die "capture exited immediately (Screen Recording?). See: ${staging}/ffmpeg-capture.log"
+  fi
+
+  echo "$PROG: recording → $raw (screen :$screen_index, ${framerate} fps, pid $cap_pid)" >&2
+  echo "$PROG: stop with: $PROG stop" >&2
+}
+
+cmd_stop() {
+  local crf="$DEFAULT_CRF" max_w="$DEFAULT_MAX_WIDTH"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --crf) crf="${2:-}"; shift 2 || die "--crf needs a value";;
+      --max-width) max_w="${2:-}"; shift 2 || die "--max-width needs a value";;
+      -h|--help) usage; exit 0;;
+      *) die "unknown option: $1";;
+    esac
+  done
+  [[ "$crf" =~ ^[0-9]+$ ]] || die "--crf must be an integer"
+  [[ "$max_w" =~ ^[0-9]+$ ]] && (( max_w >= 320 )) || die "--max-width must be an integer ≥ 320"
+
+  [[ -f "$STATE_FILE" ]] || die "no active session; run: $PROG start"
+  # shellcheck source=/dev/null
+  source "$STATE_FILE"
+
+  [[ -n "${PID:-}" ]] || die "invalid session file (no PID)"
+  kill -0 "$PID" 2>/dev/null || die "recording process not running (pid $PID). Remove stale file? rm -f $STATE_FILE"
+
+  echo "$PROG: stopping capture (pid $PID)…" >&2
+  kill -INT "$PID" 2>/dev/null || true
+  local w=0
+  while kill -0 "$PID" 2>/dev/null && (( w < 600 )); do
+    sleep 0.05
+    w=$((w + 1))
+  done
+  kill -0 "$PID" 2>/dev/null && die "ffmpeg (pid $PID) did not exit after SIGINT"
+
+  [[ -f "$RAW_FILE" ]] || die "raw recording missing: $RAW_FILE"
+
+  local ts out_mp4 vf
+  ts="$(date +%Y%m%d-%H%M%S)"
+  out_mp4="${OUT_DIR}/timelapse-${ts}.mp4"
+  mkdir -p "$OUT_DIR"
+
+  # Speed× shorter output; cap width without upscaling past native width.
+  vf="setpts=PTS/${SPEED},scale=min(iw\\,${max_w}):-2:flags=lanczos,format=yuv420p"
+
+  echo "$PROG: encoding timelapse (${SPEED}×) → $out_mp4" >&2
+  set +e
+  "$FFMPEG" -hide_banner -loglevel warning -stats \
+    -i "$RAW_FILE" \
+    -vf "$vf" \
+    -an \
+    -c:v libx264 -preset slow -crf "$crf" -pix_fmt yuv420p \
+    -movflags +faststart \
+    -y "$out_mp4" 2>"${SESSION_DIR}/ffmpeg-encode.log"
+  local enc_rc=$?
+  set -e
+
+  if [[ $enc_rc -ne 0 ]]; then
+    echo "$PROG: encode failed (exit $enc_rc); staging kept at $SESSION_DIR" >&2
+    [[ -s "${SESSION_DIR}/ffmpeg-encode.log" ]] && tail -40 "${SESSION_DIR}/ffmpeg-encode.log" >&2
+    exit "$enc_rc"
+  fi
+
+  rm -f "$STATE_FILE"
+  rm -f "${SESSION_DIR}/ffmpeg-capture.log" "${SESSION_DIR}/ffmpeg-encode.log" 2>/dev/null || true
+  rm -f "$RAW_FILE"
+  rmdir "$SESSION_DIR" 2>/dev/null || true
+  echo "$PROG: done → $out_mp4" >&2
+}
+
+require_ffmpeg
+
+[[ $# -ge 1 ]] || { usage; exit 1; }
+sub="$1"; shift
+
+case "$sub" in
+  start) cmd_start "$@" ;;
+  stop) cmd_stop "$@" ;;
+  -h|--help) usage ;;
+  *) die "unknown command: $sub (try: start | stop)" ;;
+esac
