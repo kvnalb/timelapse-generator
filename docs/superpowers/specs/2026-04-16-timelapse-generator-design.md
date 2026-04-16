@@ -55,7 +55,7 @@ A **local-only** tool on this Mac that:
 ### CLI
 
 - **`start`:** begins recording; writes **session state** (PID, temp path, start time, speedup, output directory).
-- **`stop`:** stops recording, runs transcode pipeline, writes final MP4 to the output directory (default e.g. `~/Movies/Timelapse/`), **timestamped filename**.
+- **`stop`:** stops recording, runs transcode pipeline, writes final MP4 to the output directory (default **`<repo>/output/`**, resolved from the `bin/timelapse` install path), **timestamped filename**.
 - **Concurrent sessions:** **Reject** a second `start` while an active session exists (v0).
 
 ### Permissions
@@ -64,7 +64,7 @@ A **local-only** tool on this Mac that:
 
 ## Data flow (v0)
 
-1. **Start:** Create session staging path (e.g. under `~/Movies/Timelapse/.staging/<uuid>/`), start `ffmpeg` **screen capture** to a **temporary** file (e.g. MOV/MP4 intermediate).
+1. **Start:** Create session staging path (e.g. under **`<repo>/output/.staging/<uuid>/`**), start `ffmpeg` **screen capture** to a **temporary** file (e.g. MOV/MP4 intermediate).
 2. **Stop:** Gracefully stop `ffmpeg` (signal handling), then run **second** `ffmpeg` invocation (or filter graph—implementation detail) to apply **`setpts`** for speedup, **`scale`** to max resolution, and **H.264** encode to the **final MP4**.
 3. **Success:** Remove or trim staging files; **Failure:** **Retain** staging and print paths for manual recovery.
 

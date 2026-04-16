@@ -6,13 +6,70 @@ set -euo pipefail
 readonly PROG="$(basename "$0")"
 readonly STATE_DIR="${HOME}/.timelapse-generator"
 readonly STATE_FILE="${STATE_DIR}/session.env"
-readonly DEFAULT_OUT="${HOME}/Movies/Timelapse"
 readonly DEFAULT_SPEED=60
 readonly DEFAULT_MAX_WIDTH=1280
 readonly DEFAULT_CRF=28
 readonly FFMPEG="${FFMPEG:-ffmpeg}"
 
 die() { echo "$PROG: $*" >&2; exit 1; }
+
+# Default output: <repo>/output/ (repo = parent of bin/ when installed as …/bin/timelapse).
+_timelapse_resolve_script_file() {
+  local sp="${BASH_SOURCE[0]:-$0}"
+  if [[ "$sp" != /* ]]; then
+    local base="${sp##*/}"
+    if command -v -- "$base" >/dev/null 2>&1; then
+      local cand
+      cand="$(command -v -- "$base")"
+      [[ "$cand" == /* ]] && sp="$cand"
+    fi
+  fi
+  if [[ "$sp" != /* ]]; then
+    sp="$(cd "$(dirname "$sp")" && pwd)/$(basename "$sp")"
+  fi
+  [[ -f "$sp" ]] || die "cannot resolve timelapse script path (use ./timelapse.sh or PATH to …/bin/timelapse)"
+  echo "$sp"
+}
+readonly TIMELAPSE_SCRIPT_FILE="$(_timelapse_resolve_script_file)"
+readonly TIMELAPSE_SCRIPT_DIR="$(cd "$(dirname "$TIMELAPSE_SCRIPT_FILE")" && pwd)"
+if [[ "$(basename "$TIMELAPSE_SCRIPT_DIR")" == "bin" ]]; then
+  readonly TIMELAPSE_PROJECT_ROOT="$(cd "$TIMELAPSE_SCRIPT_DIR/.." && pwd)"
+else
+  readonly TIMELAPSE_PROJECT_ROOT="$TIMELAPSE_SCRIPT_DIR"
+fi
+readonly DEFAULT_OUT="${TIMELAPSE_PROJECT_ROOT}/output"
+
+# Stop capture ffmpeg. AVFoundation often needs many seconds on SIGINT alone; SIGKILL last (it wrecks the .ts).
+stop_capture_ffmpeg() {
+  local pid="$1"
+  local i
+  kill -INT "$pid" 2>/dev/null || true
+  # ~20s on SIGINT (nudge every ~5s); then ~12s SIGTERM; then SIGKILL.
+  for ((i = 0; i < 400; i++)); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    if (( i == 100 || i == 200 || i == 300 )); then
+      kill -INT "$pid" 2>/dev/null || true
+    fi
+    sleep 0.05
+  done
+  echo "$PROG: sending SIGTERM…" >&2
+  kill -TERM "$pid" 2>/dev/null || true
+  for ((i = 0; i < 240; i++)); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.05
+  done
+  echo "$PROG: sending SIGKILL (recording file may be unusable)…" >&2
+  kill -KILL "$pid" 2>/dev/null || true
+  sleep 0.5
+  kill -0 "$pid" 2>/dev/null && die "could not stop ffmpeg (pid $pid)"
+}
+
+# Remux helper (must be top-level for macOS /bin/bash 3.2 — no nested functions).
+timelapse_remux_attempt() {
+  local logf="$1" outf="$2"
+  shift 2
+  "$FFMPEG" -nostdin -hide_banner -loglevel warning "$@" -y "$outf" 2>"$logf"
+}
 
 # macOS Screen Recording is granted per host app (Cursor, Terminal, iTerm, …), not per shell script.
 host_app_for_screen_recording() {
@@ -63,7 +120,7 @@ cleanup_stale_session() {
 }
 
 write_state() {
-  local staging="$1" raw="$2" speed="$3" out_dir="$4" screen_index="$5" framerate="$6" cap_pid="$7"
+  local staging="$1" raw="$2" speed="$3" out_dir="$4" screen_index="$5" framerate="$6" cap_pid="$7" max_w="$8" crf="$9"
   ensure_state_dir
   {
     printf 'SESSION_DIR=%q\n' "$staging"
@@ -73,6 +130,8 @@ write_state() {
     printf 'SCREEN_INDEX=%q\n' "$screen_index"
     printf 'FRAMERATE=%q\n' "$framerate"
     printf 'PID=%q\n' "$cap_pid"
+    printf 'MAX_WIDTH=%q\n' "$max_w"
+    printf 'CRF=%q\n' "$crf"
   } >"${STATE_FILE}.tmp"
   mv "${STATE_FILE}.tmp" "$STATE_FILE"
 }
@@ -80,38 +139,46 @@ write_state() {
 usage() {
   cat <<EOF
 Usage:
-  $PROG start [--speed N] [--out-dir DIR] [--screen-index I] [--framerate F]
-  $PROG stop  [--crf N] [--max-width W]
+  $PROG start [--speed N] [--out-dir DIR] [--screen-index I] [--framerate F] [--max-width W] [--crf C]
+  $PROG stop
 
-Record the main display with ffmpeg (AVFoundation), then encode a fixed-speedup
-H.264 MP4 (yuv420p), no audio.
+Record the main display (AVFoundation). Timelapse is applied **during capture**
+(one ffmpeg: frame decimation + scale + H.264 into MPEG-TS). **stop** only
+remuxes to MP4 with **stream copy** (seconds, not the length of the recording).
 
-Defaults: speed=${DEFAULT_SPEED}, out-dir=$DEFAULT_OUT, encode max-width=${DEFAULT_MAX_WIDTH}, crf=${DEFAULT_CRF}
+--speed must be a positive integer (keeps every Nth frame ≈ N× timelapse).
+
+Defaults: speed=${DEFAULT_SPEED}, out-dir=$DEFAULT_OUT, max-width=${DEFAULT_MAX_WIDTH}, crf=${DEFAULT_CRF}
 
 Environment:
   FFMPEG   path to ffmpeg (default: ffmpeg on PATH)
 
 Examples:
   $PROG start
-  $PROG start --speed 30 --out-dir ~/Desktop
+  $PROG start --speed 30 --out-dir ~/Desktop --crf 32
   $PROG stop
 EOF
 }
 
 cmd_start() {
   local speed="$DEFAULT_SPEED" out_dir="$DEFAULT_OUT" screen_index="" framerate=30
+  local crf="$DEFAULT_CRF" max_w="$DEFAULT_MAX_WIDTH"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --speed) speed="${2:-}"; shift 2 || die "--speed needs a value";;
       --out-dir) out_dir="${2:-}"; shift 2 || die "--out-dir needs a path";;
       --screen-index) screen_index="${2:-}"; shift 2 || die "--screen-index needs a number";;
       --framerate) framerate="${2:-}"; shift 2 || die "--framerate needs a value";;
+      --crf) crf="${2:-}"; shift 2 || die "--crf needs a value";;
+      --max-width) max_w="${2:-}"; shift 2 || die "--max-width needs a value";;
       -h|--help) usage; exit 0;;
       *) die "unknown option: $1";;
     esac
   done
   [[ "$speed" =~ ^[0-9]+$ ]] && (( speed >= 1 )) || die "--speed must be a positive integer"
   [[ "$framerate" =~ ^[0-9]+$ ]] && (( framerate >= 1 )) || die "--framerate must be a positive integer"
+  [[ "$crf" =~ ^[0-9]+$ ]] || die "--crf must be an integer"
+  [[ "$max_w" =~ ^[0-9]+$ ]] && (( max_w >= 320 )) || die "--max-width must be an integer ≥ 320"
 
   cleanup_stale_session
   if [[ -f "$STATE_FILE" ]]; then
@@ -125,21 +192,27 @@ cmd_start() {
   session_id="$(uuidgen 2>/dev/null || openssl rand -hex 8)"
   staging="${out_dir}/.staging/${session_id}"
   mkdir -p "$staging"
-  raw="${staging}/raw.mp4"
+  # MPEG-TS survives SIGINT/SIGTERM much better than MP4 (no trailing moov required).
+  raw="${staging}/raw.ts"
 
   [[ -n "$screen_index" ]] || screen_index="$(avfoundation_screen_index)"
   [[ "$screen_index" =~ ^[0-9]+$ ]] || die "invalid --screen-index"
 
+  # Timelapse while capturing: keep every SPEED-th frame, scale, encode to TS (grows on disk; no long post-encode).
+  local vf="framestep=${speed},scale=min(iw\\,${max_w}):-2:flags=lanczos,format=yuv420p"
+
   set +e
-  "$FFMPEG" -hide_banner -loglevel warning \
+  "$FFMPEG" -nostdin -hide_banner -loglevel warning \
     -f avfoundation -capture_cursor 1 -framerate "$framerate" \
     -i "${screen_index}:none" \
-    -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p \
+    -vf "$vf" \
+    -c:v libx264 -preset veryfast -crf "$crf" -pix_fmt yuv420p \
     -an \
+    -f mpegts \
     -y "$raw" 2>"${staging}/ffmpeg-capture.log" &
   local cap_pid=$!
   set -e
-  write_state "$staging" "$raw" "$speed" "$out_dir" "$screen_index" "$framerate" "$cap_pid"
+  write_state "$staging" "$raw" "$speed" "$out_dir" "$screen_index" "$framerate" "$cap_pid" "$max_w" "$crf"
 
   sleep 0.35
   if ! kill -0 "$cap_pid" 2>/dev/null; then
@@ -148,22 +221,19 @@ cmd_start() {
     die "capture exited immediately (Screen Recording?). See: ${staging}/ffmpeg-capture.log"
   fi
 
-  echo "$PROG: recording → $raw (screen :$screen_index, ${framerate} fps, pid $cap_pid)" >&2
-  echo "$PROG: stop with: $PROG stop" >&2
+  echo "$PROG: recording ${speed}× timelapse → $raw (screen :$screen_index, ${framerate} fps, pid $cap_pid)" >&2
+  echo "$PROG: stop with: $PROG stop (remux only; should be quick)" >&2
 }
 
 cmd_stop() {
-  local crf="$DEFAULT_CRF" max_w="$DEFAULT_MAX_WIDTH"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --crf) crf="${2:-}"; shift 2 || die "--crf needs a value";;
-      --max-width) max_w="${2:-}"; shift 2 || die "--max-width needs a value";;
+      --crf|--max-width)
+        die "quality is set on start (--crf, --max-width); this session used: start … then stop (no extra flags needed)";;
       -h|--help) usage; exit 0;;
       *) die "unknown option: $1";;
     esac
   done
-  [[ "$crf" =~ ^[0-9]+$ ]] || die "--crf must be an integer"
-  [[ "$max_w" =~ ^[0-9]+$ ]] && (( max_w >= 320 )) || die "--max-width must be an integer ≥ 320"
 
   [[ -f "$STATE_FILE" ]] || die "no active session; run: $PROG start"
   # shellcheck source=/dev/null
@@ -173,44 +243,48 @@ cmd_stop() {
   kill -0 "$PID" 2>/dev/null || die "recording process not running (pid $PID). Remove stale file? rm -f $STATE_FILE"
 
   echo "$PROG: stopping capture (pid $PID)…" >&2
-  kill -INT "$PID" 2>/dev/null || true
-  local w=0
-  while kill -0 "$PID" 2>/dev/null && (( w < 600 )); do
-    sleep 0.05
-    w=$((w + 1))
-  done
-  kill -0 "$PID" 2>/dev/null && die "ffmpeg (pid $PID) did not exit after SIGINT"
+  stop_capture_ffmpeg "$PID"
 
   [[ -f "$RAW_FILE" ]] || die "raw recording missing: $RAW_FILE"
+  local sz
+  sz="$(wc -c <"$RAW_FILE" | tr -d ' ')"
+  (( sz >= 1024 )) || {
+    rm -f "$STATE_FILE"
+    die "raw recording is empty or too small ($sz bytes): $RAW_FILE — session cleared; remove staging if you like: rm -rf $SESSION_DIR"
+  }
 
-  local ts out_mp4 vf
+  local ts out_mp4 logf
   ts="$(date +%Y%m%d-%H%M%S)"
   out_mp4="${OUT_DIR}/timelapse-${ts}.mp4"
+  logf="${SESSION_DIR}/ffmpeg-remux.log"
   mkdir -p "$OUT_DIR"
 
-  # Speed× shorter output; cap width without upscaling past native width.
-  vf="setpts=PTS/${SPEED},scale=min(iw\\,${max_w}):-2:flags=lanczos,format=yuv420p"
-
-  echo "$PROG: encoding timelapse (${SPEED}×) → $out_mp4" >&2
+  echo "$PROG: remuxing to MP4 (stream copy)…" >&2
   set +e
-  "$FFMPEG" -hide_banner -loglevel warning -stats \
-    -i "$RAW_FILE" \
-    -vf "$vf" \
-    -an \
-    -c:v libx264 -preset slow -crf "$crf" -pix_fmt yuv420p \
-    -movflags +faststart \
-    -y "$out_mp4" 2>"${SESSION_DIR}/ffmpeg-encode.log"
+  timelapse_remux_attempt "$logf" "$out_mp4" -i "$RAW_FILE" -c:v copy -an
   local enc_rc=$?
+  if [[ $enc_rc -ne 0 ]]; then
+    echo "$PROG: remux retry with genpts / ignore_err…" >&2
+    timelapse_remux_attempt "$logf" "$out_mp4" -fflags +genpts -err_detect ignore_err -i "$RAW_FILE" -c:v copy -an
+    enc_rc=$?
+  fi
+  if [[ $enc_rc -ne 0 ]]; then
+    echo "$PROG: remux retry (re-encode, slower)…" >&2
+    timelapse_remux_attempt "$logf" "$out_mp4" -err_detect ignore_err -i "$RAW_FILE" -an -c:v libx264 -preset ultrafast -crf "${CRF:-28}" -pix_fmt yuv420p
+    enc_rc=$?
+  fi
   set -e
 
   if [[ $enc_rc -ne 0 ]]; then
-    echo "$PROG: encode failed (exit $enc_rc); staging kept at $SESSION_DIR" >&2
-    [[ -s "${SESSION_DIR}/ffmpeg-encode.log" ]] && tail -40 "${SESSION_DIR}/ffmpeg-encode.log" >&2
+    echo "$PROG: remux failed (exit $enc_rc); staging: $SESSION_DIR" >&2
+    echo "$PROG: session cleared so you can run start again. Try by hand: $FFMPEG -i \"$RAW_FILE\" -c copy -an fixed.mp4" >&2
+    [[ -s "${SESSION_DIR}/ffmpeg-remux.log" ]] && tail -40 "${SESSION_DIR}/ffmpeg-remux.log" >&2
+    rm -f "$STATE_FILE"
     exit "$enc_rc"
   fi
 
   rm -f "$STATE_FILE"
-  rm -f "${SESSION_DIR}/ffmpeg-capture.log" "${SESSION_DIR}/ffmpeg-encode.log" 2>/dev/null || true
+  rm -f "${SESSION_DIR}/ffmpeg-capture.log" "${SESSION_DIR}/ffmpeg-remux.log" 2>/dev/null || true
   rm -f "$RAW_FILE"
   rmdir "$SESSION_DIR" 2>/dev/null || true
   echo "$PROG: done → $out_mp4" >&2
