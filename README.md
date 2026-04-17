@@ -67,6 +67,10 @@ Defaults: **60×** speedup, files under **`<repo>/output/`** (see section above)
 
 Override ffmpeg path: `FFMPEG=/opt/homebrew/bin/ffmpeg ./timelapse.sh start`.
 
+## Timelapse math (`--speed`)
+
+Capture uses **`framestep`** (keep every Nth frame) **and** **`setpts=PTS/N`** so the **file duration** is ~recording_length÷N. Without `setpts`, you’d get a long file with sparse frames (looks like “full video”).
+
 ## Empty `raw.ts` / “0 bytes” after `stop`
 
 Wait **a few seconds** after `start` before `stop`, especially with **high `--speed`** (fewer frames written per second of wall clock). If it still fails, check **`output/.staging/.../ffmpeg-capture.log`** (Screen Recording permission, odd display size, etc.).

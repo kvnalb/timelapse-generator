@@ -198,9 +198,9 @@ cmd_start() {
   [[ -n "$screen_index" ]] || screen_index="$(avfoundation_screen_index)"
   [[ "$screen_index" =~ ^[0-9]+$ ]] || die "invalid --screen-index"
 
-  # Timelapse while capturing: keep every SPEED-th frame, scale, encode to TS (grows on disk; no long post-encode).
+  # Timelapse while capturing: framestep drops frames; setpts compresses PTS (without this, duration stays wall-clock = "full video").
   # force_divisible_by=2: libx264 requires even size. muxdelay/preload+zerolatency+short GOP: first TS packets land quickly.
-  local vf="framestep=${speed},scale=min(iw\\,${max_w}):-2:flags=lanczos:force_divisible_by=2,format=yuv420p"
+  local vf="framestep=${speed},setpts=PTS/${speed},scale=min(iw\\,${max_w}):-2:flags=lanczos:force_divisible_by=2,format=yuv420p"
 
   set +e
   "$FFMPEG" -nostdin -hide_banner -loglevel warning -flush_packets 1 \
